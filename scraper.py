@@ -26,29 +26,45 @@ def save_history(history):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
-def extract_real_image_url(item, base_url):
-    """HTML文字列から指定の画像CDNドメインを直接ぶっこ抜く（超強力版）"""
-    item_html = str(item)
+def extract_real_image_url(item):
+    """HTMLテキスト全体からebookjapanのCDN画像URLを問答無用で引っこ抜く"""
+    html_str = str(item)
     
-    # 修正箇所: https://や//などの接頭辞に依存せず、ドメイン部分から問答無用で抽出する
-    cdn_match = re.search(r'(cache\d*-ebookjapan\.akamaized\.net/[^"\'\s<>]+)', item_html)
-    if cdn_match:
-        # 抽出したURL文字列のゴミ（エスケープ文字）を掃除して返す
-        clean_url = cdn_match.group(1).replace('\\/', '/').replace('&amp;', '&')
-        return "https://" + clean_url
+    # 1. akamaized.net を含むURLを正規表現で全検索（http始まり、//始まり両対応）
+    cdn_matches = re.findall(r'(?:https?:)?//[a-zA-Z0-9-]+\.akamaized\.net/[^"\'\s<>]+', html_str)
+    if cdn_matches:
+        for match in cdn_matches:
+            # エスケープ文字などを掃除
+            clean_url = match.replace('\\/', '/').replace('&amp;', '&')
+            if clean_url.startswith('//'):
+                clean_url = 'https:' + clean_url
+            
+            # 透過ダミー画像は除外して最初の本物URLを返す
+            if "noimage" not in clean_url.lower() and not clean_url.endswith(".gif"):
+                return clean_url
 
-    # 見つからなかった場合の予備手段
+    # 2. タグの属性を全探索（JSON等で埋め込まれている場合）
+    for tag in item.find_all(True):
+        for attr, value in tag.attrs.items():
+            if isinstance(value, list):
+                value = " ".join(value)
+            if isinstance(value, str) and "akamaized.net" in value:
+                if value.startswith("//"):
+                    return "https:" + value
+                elif value.startswith("http"):
+                    return value
+
+    # 3. 最終手段：imgタグのありとあらゆる属性をチェック
     for tag in item.find_all(["img", "source"]):
-        for attr in ["data-original", "data-src", "srcset", "src", "lazy-src"]:
+        for attr in ["src", "data-src", "data-original", "srcset", "lazy-src"]:
             val = tag.get(attr)
             if val:
-                urls = [u.strip().split(" ")[0] for u in val.split(",") if u.strip()]
-                for u in urls:
-                    if not u.startswith("data:image") and not u.endswith(".gif") and "noimage" not in u.lower():
-                        if u.startswith("//"):
-                            return "https:" + u
-                        elif u.startswith("http"):
-                            return u
+                u = str(val).split(" ")[0].strip()
+                if not u.startswith("data:image") and not u.endswith(".gif"):
+                    if u.startswith("//"):
+                        return "https:" + u
+                    elif u.startswith("http"):
+                        return u
     return ""
 
 def scrape_books(base_url):
@@ -74,37 +90,36 @@ def scrape_books(base_url):
 
         soup = BeautifulSoup(res.text, "html.parser")
 
-        items = soup.select(".book-item")
+        # 本の要素ブロックを広く取得
+        items = soup.select(".book-item, li.item, div.item, .list-item")
         if not items:
-            items = soup.select("li.item, div.item, .list-item")
-            if not items:
-                items = [a.parent for a in soup.find_all("a") if a.find("img")]
+            items = [a.parent for a in soup.find_all("a") if a.find("img")]
                 
         if not items:
             break
             
         for item in items:
-            link_tag = item.select_one("a")
+            link_tag = item.find("a")
             if not link_tag:
                 continue
 
+            # ① タイトル引っこ抜き
             title_tag = item.select_one(".title, .name, .book-title, h2, h3")
-            
-            # 修正した関数で画像リンクを読み取り
-            img_url = extract_real_image_url(item, base_url)
-
-            title = ""
             if title_tag:
                 title = title_tag.text.strip()
             elif item.find("img") and item.find("img").get("alt"):
                 title = item.find("img").get("alt").strip()
             else:
                 title = link_tag.text.strip()
-                
+            
             if not title:
                 title = "タイトル不明"
 
+            # ② 商品URL引っこ抜き
             book_url = urljoin(base_url, link_tag.get("href", ""))
+
+            # ③ 画像URL引っこ抜き
+            img_url = extract_real_image_url(item)
 
             books.append({
                 "title": title,
@@ -113,7 +128,7 @@ def scrape_books(base_url):
             })
         
         current_page += 1
-        if current_page > 20:
+        if current_page > 20: # 暴走防止
             break
 
     return books
@@ -145,6 +160,7 @@ def main():
 
     new_books = []
     for book in all_books:
+        # URLをベースに重複チェック
         if book["url"] not in history:
             new_books.append(book)
             history.append(book["url"])
@@ -154,17 +170,21 @@ def main():
         save_history(history)
         return
 
+    # コメント作成（Markdownフォーマット）
     body_lines = []
     for i, book in enumerate(new_books, 1):
         body_lines.append(f"{i}. [{book['title']}]({book['url']})")
         
-        # 取得できた画像URLをそのまま挿入
         if book.get("img"):
+            # 画像タグを直接挿入
             body_lines.append(f'<img src="{book["img"]}" width="200">')
-        
-        body_lines.append("")
+        else:
+            # 抽出失敗の確認用（デバッグ）
+            body_lines.append("*(画像URL取得失敗)*")
+            
+        body_lines.append("") # 空行
 
-    body_lines.append("\n@ari20260322")
+    body_lines.append(f"\n@ari20260322")
     comment_body = "\n".join(body_lines)
 
     issue_number = get_or_create_issue()
