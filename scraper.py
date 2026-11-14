@@ -2,7 +2,7 @@ import os
 import json
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 SUBJECT = os.environ.get("SUBJECT")
@@ -13,37 +13,69 @@ HISTORY_FILE = "history.json"
 def load_history():
     if os.path.exists(HISTORY_FILE):
         with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                return []
     return []
 
 def save_history(history):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
-def scrape_books(start_url):
+def scrape_books(base_url):
     books = []
-    url = start_url
-    visited_pages = set()
+    current_page = 1
+    
+    # 連続アクセスでブロックされないようブラウザと同じ情報を付与
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
 
-    while url and url not in visited_pages:
-        visited_pages.add(url)
-        print(f"Scraping page: {url}")
-        res = requests.get(url)
-        res.raise_for_status()
+    while True:
+        # 指定されたURLにページ番号パラメータ（page=1, 2, 3...）を結合して複数ページに対応
+        parsed_url = urlparse(base_url)
+        query = parse_qs(parsed_url.query)
+        query['page'] = [str(current_page)]
+        new_query = urlencode(query, doseq=True)
+        page_url = urlunparse(parsed_url._replace(query=new_query))
+        
+        print(f"Scraping page {current_page}: {page_url}")
+        res = requests.get(page_url, headers=headers)
+        
+        # エラーが出た場合やページが存在しない場合はループ終了
+        if res.status_code != 200:
+            break
+
         soup = BeautifulSoup(res.text, "html.parser")
 
-        # ※対象サイトの実際のHTMLに合わせて要変更
-        items = soup.select(".book-item")
+        # ==========================================
+        # 【重要】ebookjapanのHTML構造に合わせたCSSセレクタ
+        # ※ブラウザの「検証(F12)」で実際のクラス名を確認して書き換えてください。
+        # 以下は一般的な書籍リスト要素の仮名です。
+        # ==========================================
+        items = soup.select(".book-item") # 本1冊を囲む大枠のタグ
         
+        # ページ内に本が1冊も無くなったら最後のページとみなして終了
+        if not items:
+            break
+            
         for item in items:
-            title_tag = item.select_one(".title a")
-            img_tag = item.select_one("img")
+            link_tag = item.select_one("a")      # リンクタグ
+            title_tag = item.select_one(".title") # タイトル名が入っているタグ
+            img_tag = item.select_one("img")      # 画像タグ
 
-            if title_tag and img_tag:
-                title = title_tag.text.strip()
-                book_url = urljoin(start_url, title_tag.get("href", ""))
+            if link_tag and img_tag:
+                # タイトルタグが取れなければ画像のalt属性で代用
+                title = title_tag.text.strip() if title_tag else img_tag.get("alt", "No Title")
+                book_url = urljoin(base_url, link_tag.get("href", ""))
+                
+                # 画像の遅延読み込み(Lazy Load)に対応するため data-src も確認
                 img_url = img_tag.get("src", "")
-                if img_url.startswith("//"):
+                if not img_url or "data:image" in img_url:
+                    img_url = img_tag.get("data-src", img_url)
+
+                if img_url and img_url.startswith("//"):
                     img_url = "https:" + img_url
 
                 books.append({
@@ -51,12 +83,8 @@ def scrape_books(start_url):
                     "url": book_url,
                     "img": img_url
                 })
-
-        next_page = soup.select_one(".next-page a")
-        if next_page and next_page.get("href"):
-            url = urljoin(start_url, next_page.get("href"))
-        else:
-            url = None
+        
+        current_page += 1
 
     return books
 
@@ -66,7 +94,6 @@ def get_or_create_issue():
         "Accept": "application/vnd.github.v3+json"
     }
     
-    # 1. オープンなIssue一覧を取得し、A列の件名と同じIssueがあるか探す
     url = f"https://api.github.com/repos/{REPO}/issues?state=open"
     res = requests.get(url, headers=headers)
     res.raise_for_status()
@@ -74,9 +101,8 @@ def get_or_create_issue():
     
     for issue in issues:
         if issue.get("title") == SUBJECT:
-            return issue.get("number") # 既存のIssue番号を返す
+            return issue.get("number")
             
-    # 2. なければ最初の1回目として新規作成する
     create_url = f"https://api.github.com/repos/{REPO}/issues"
     data = {"title": SUBJECT, "body": f"{SUBJECT} の新刊通知用イシューです。"}
     res = requests.post(create_url, headers=headers, json=data)
@@ -95,6 +121,8 @@ def main():
 
     if not new_books:
         print("新刊はありませんでした。")
+        # 履歴ファイルが存在しない初期エラーを防ぐため保存処理を通す
+        save_history(history)
         return
 
     # コメント本文を作成
@@ -107,7 +135,6 @@ def main():
     body_lines.append("\n@ari20260322")
     comment_body = "\n".join(body_lines)
 
-    # Issue番号を取得して、コメント（追記）として送信する
     issue_number = get_or_create_issue()
     comment_url = f"https://api.github.com/repos/{REPO}/issues/{issue_number}/comments"
     
