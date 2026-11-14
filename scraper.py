@@ -10,7 +10,6 @@ SUBJECT = os.environ.get("SUBJECT")
 TARGET_URL = os.environ.get("TARGET_URL")
 REPO = "ari20260322/ebooksjapan"
 
-# 件名から記号を除外して安全なファイル名を作る（例: history_漫画雑誌.json）
 safe_subject = "".join([c if c.isalnum() else "_" for c in SUBJECT]) if SUBJECT else "default"
 HISTORY_FILE = f"history_{safe_subject}.json"
 
@@ -28,40 +27,27 @@ def save_history(history):
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 def extract_real_image_url(item, base_url):
-    """遅延読み込みを回避して本物の画像URLを抽出する関数"""
-    # 1. <img>タグと<source>タグからあらゆる属性をチェック
-    tags = item.find_all(["img", "source"])
-    for tag in tags:
-        for attr in ["data-original", "data-src", "srcset", "src", "data-lazy-src", "lazy-src"]:
+    """HTML文字列から指定の画像CDNドメインを直接ぶっこ抜く"""
+    item_html = str(item)
+    
+    # 1. ユーザーから提示されたebookjapanのCDNドメインを直接正規表現で読み取る
+    cdn_match = re.search(r'(https://cache\d*-ebookjapan\.akamaized\.net/[^"\'\s<>]+)', item_html)
+    if cdn_match:
+        # HTMLエンティティ（&amp;など）を元に戻して返す
+        return cdn_match.group(1).replace('&amp;', '&')
+
+    # 2. 見つからなかった場合の予備手段（汎用的な画像URL抽出）
+    for tag in item.find_all(["img", "source"]):
+        for attr in ["data-original", "data-src", "srcset", "src"]:
             val = tag.get(attr)
             if val:
-                # srcset のように複数URLが入っている場合は分割して最初のものを取得
                 urls = [u.strip().split(" ")[0] for u in val.split(",") if u.strip()]
                 for u in urls:
-                    # ダミーの透明画像（data:imageや.gif）は無視する
-                    if not u.startswith("data:image") and not u.endswith(".gif"):
+                    if not u.startswith("data:image") and not u.endswith(".gif") and "noimage" not in u.lower():
                         if u.startswith("//"):
                             return "https:" + u
                         elif u.startswith("http"):
                             return u
-                        elif u.startswith("/"):
-                            return urljoin(base_url, u)
-                            
-    # 2. style属性（background-image）に隠されている場合を探す
-    for tag in item.find_all(style=True):
-        style = tag.get("style", "")
-        if "background-image" in style:
-            match = re.search(r"url\(['\"]?(.*?)['\"]?\)", style)
-            if match:
-                u = match.group(1)
-                if not u.startswith("data:image") and not u.endswith(".gif"):
-                    if u.startswith("//"):
-                        return "https:" + u
-                    elif u.startswith("http"):
-                        return u
-                    elif u.startswith("/"):
-                        return urljoin(base_url, u)
-    
     return ""
 
 def scrape_books(base_url):
@@ -87,10 +73,9 @@ def scrape_books(base_url):
 
         soup = BeautifulSoup(res.text, "html.parser")
 
-        # 本のリスト要素を取得（ebookjapanの構造に対応）
+        # 本のリスト要素を取得
         items = soup.select(".book-item")
         if not items:
-            # 万が一クラス名が違った場合のフォールバック
             items = soup.select("li.item, div.item, .list-item")
             if not items:
                 items = [a.parent for a in soup.find_all("a") if a.find("img")]
@@ -100,14 +85,13 @@ def scrape_books(base_url):
             
         for item in items:
             link_tag = item.select_one("a")
-            
             if not link_tag:
                 continue
 
             # タイトルの取得
             title_tag = item.select_one(".title, .name, .book-title, h2, h3")
             
-            # 本物の画像URLを抽出
+            # 画像リンクを直接読み取り
             img_url = extract_real_image_url(item, base_url)
 
             title = ""
@@ -130,7 +114,6 @@ def scrape_books(base_url):
             })
         
         current_page += 1
-        # 無限ループ防止（最大20ページまで）
         if current_page > 20:
             break
 
@@ -176,8 +159,8 @@ def main():
     for i, book in enumerate(new_books, 1):
         body_lines.append(f"{i}. [{book['title']}]({book['url']})")
         
-        # 正常なURL（httpから始まる）が取得できている場合のみ<img>タグを挿入
-        if book.get("img") and book["img"].startswith("http"):
+        # 取得できた画像URLをそのまま挿入
+        if book.get("img"):
             body_lines.append(f'<img src="{book["img"]}" width="200">')
         
         body_lines.append("")
