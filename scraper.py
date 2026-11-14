@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
@@ -26,6 +27,43 @@ def save_history(history):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
+def extract_real_image_url(item, base_url):
+    """遅延読み込みを回避して本物の画像URLを抽出する関数"""
+    # 1. <img>タグと<source>タグからあらゆる属性をチェック
+    tags = item.find_all(["img", "source"])
+    for tag in tags:
+        for attr in ["data-original", "data-src", "srcset", "src", "data-lazy-src", "lazy-src"]:
+            val = tag.get(attr)
+            if val:
+                # srcset のように複数URLが入っている場合は分割して最初のものを取得
+                urls = [u.strip().split(" ")[0] for u in val.split(",") if u.strip()]
+                for u in urls:
+                    # ダミーの透明画像（data:imageや.gif）は無視する
+                    if not u.startswith("data:image") and not u.endswith(".gif"):
+                        if u.startswith("//"):
+                            return "https:" + u
+                        elif u.startswith("http"):
+                            return u
+                        elif u.startswith("/"):
+                            return urljoin(base_url, u)
+                            
+    # 2. style属性（background-image）に隠されている場合を探す
+    for tag in item.find_all(style=True):
+        style = tag.get("style", "")
+        if "background-image" in style:
+            match = re.search(r"url\(['\"]?(.*?)['\"]?\)", style)
+            if match:
+                u = match.group(1)
+                if not u.startswith("data:image") and not u.endswith(".gif"):
+                    if u.startswith("//"):
+                        return "https:" + u
+                    elif u.startswith("http"):
+                        return u
+                    elif u.startswith("/"):
+                        return urljoin(base_url, u)
+    
+    return ""
+
 def scrape_books(base_url):
     books = []
     current_page = 1
@@ -49,40 +87,52 @@ def scrape_books(base_url):
 
         soup = BeautifulSoup(res.text, "html.parser")
 
-        # ebookjapanの書籍リスト要素（正常に動いていた既存のセレクタ）
+        # 本のリスト要素を取得（ebookjapanの構造に対応）
         items = soup.select(".book-item")
-        
+        if not items:
+            # 万が一クラス名が違った場合のフォールバック
+            items = soup.select("li.item, div.item, .list-item")
+            if not items:
+                items = [a.parent for a in soup.find_all("a") if a.find("img")]
+                
         if not items:
             break
             
         for item in items:
             link_tag = item.select_one("a")
-            title_tag = item.select_one(".title")
-            img_tag = item.select_one("img")
+            
+            if not link_tag:
+                continue
 
-            if link_tag and img_tag:
-                title = title_tag.text.strip() if title_tag else img_tag.get("alt", "No Title")
-                book_url = urljoin(base_url, link_tag.get("href", ""))
+            # タイトルの取得
+            title_tag = item.select_one(".title, .name, .book-title, h2, h3")
+            
+            # 本物の画像URLを抽出
+            img_url = extract_real_image_url(item, base_url)
+
+            title = ""
+            if title_tag:
+                title = title_tag.text.strip()
+            elif item.find("img") and item.find("img").get("alt"):
+                title = item.find("img").get("alt").strip()
+            else:
+                title = link_tag.text.strip()
                 
-                img_url = ""
-                # 本命の画像URLが隠されている属性を優先順位をつけて探す
-                for attr in ["data-original", "data-src", "srcset", "src"]:
-                    val = img_tag.get(attr)
-                    # "data:image" から始まるダミー画像を除外
-                    if val and not val.startswith("data:image"):
-                        img_url = val.split(" ")[0] # 不要なスペースを取り除く
-                        break
+            if not title:
+                title = "タイトル不明"
 
-                if img_url.startswith("//"):
-                    img_url = "https:" + img_url
+            book_url = urljoin(base_url, link_tag.get("href", ""))
 
-                books.append({
-                    "title": title,
-                    "url": book_url,
-                    "img": img_url
-                })
+            books.append({
+                "title": title,
+                "url": book_url,
+                "img": img_url
+            })
         
         current_page += 1
+        # 無限ループ防止（最大20ページまで）
+        if current_page > 20:
+            break
 
     return books
 
@@ -122,13 +172,14 @@ def main():
         save_history(history)
         return
 
-    # コメント本文を作成
     body_lines = []
     for i, book in enumerate(new_books, 1):
         body_lines.append(f"{i}. [{book['title']}]({book['url']})")
-        # 画像URLが取得できている場合のみ表示する
-        if book.get("img"):
+        
+        # 正常なURL（httpから始まる）が取得できている場合のみ<img>タグを挿入
+        if book.get("img") and book["img"].startswith("http"):
             body_lines.append(f'<img src="{book["img"]}" width="200">')
+        
         body_lines.append("")
 
     body_lines.append("\n@ari20260322")
