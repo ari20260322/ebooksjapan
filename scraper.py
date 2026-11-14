@@ -8,7 +8,10 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 SUBJECT = os.environ.get("SUBJECT")
 TARGET_URL = os.environ.get("TARGET_URL")
 REPO = "ari20260322/ebooksjapan"
-HISTORY_FILE = "history.json"
+
+# 件名から記号を除外して安全なファイル名を作る（例: history_漫画雑誌.json）
+safe_subject = "".join([c if c.isalnum() else "_" for c in SUBJECT]) if SUBJECT else "default"
+HISTORY_FILE = f"history_{safe_subject}.json"
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
@@ -27,13 +30,11 @@ def scrape_books(base_url):
     books = []
     current_page = 1
     
-    # 連続アクセスでブロックされないようブラウザと同じ情報を付与
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
     while True:
-        # 指定されたURLにページ番号パラメータ（page=1, 2, 3...）を結合して複数ページに対応
         parsed_url = urlparse(base_url)
         query = parse_qs(parsed_url.query)
         query['page'] = [str(current_page)]
@@ -43,39 +44,36 @@ def scrape_books(base_url):
         print(f"Scraping page {current_page}: {page_url}")
         res = requests.get(page_url, headers=headers)
         
-        # エラーが出た場合やページが存在しない場合はループ終了
         if res.status_code != 200:
             break
 
         soup = BeautifulSoup(res.text, "html.parser")
 
-        # ==========================================
-        # 【重要】ebookjapanのHTML構造に合わせたCSSセレクタ
-        # ※ブラウザの「検証(F12)」で実際のクラス名を確認して書き換えてください。
-        # 以下は一般的な書籍リスト要素の仮名です。
-        # ==========================================
-        items = soup.select(".book-item") # 本1冊を囲む大枠のタグ
+        # ebookjapanの書籍リスト要素（正常に動いていた既存のセレクタ）
+        items = soup.select(".book-item")
         
-        # ページ内に本が1冊も無くなったら最後のページとみなして終了
         if not items:
             break
             
         for item in items:
-            link_tag = item.select_one("a")      # リンクタグ
-            title_tag = item.select_one(".title") # タイトル名が入っているタグ
-            img_tag = item.select_one("img")      # 画像タグ
+            link_tag = item.select_one("a")
+            title_tag = item.select_one(".title")
+            img_tag = item.select_one("img")
 
             if link_tag and img_tag:
-                # タイトルタグが取れなければ画像のalt属性で代用
                 title = title_tag.text.strip() if title_tag else img_tag.get("alt", "No Title")
                 book_url = urljoin(base_url, link_tag.get("href", ""))
                 
-                # 画像の遅延読み込み(Lazy Load)に対応するため data-src も確認
-                img_url = img_tag.get("src", "")
-                if not img_url or "data:image" in img_url:
-                    img_url = img_tag.get("data-src", img_url)
+                img_url = ""
+                # 本命の画像URLが隠されている属性を優先順位をつけて探す
+                for attr in ["data-original", "data-src", "srcset", "src"]:
+                    val = img_tag.get(attr)
+                    # "data:image" から始まるダミー画像を除外
+                    if val and not val.startswith("data:image"):
+                        img_url = val.split(" ")[0] # 不要なスペースを取り除く
+                        break
 
-                if img_url and img_url.startswith("//"):
+                if img_url.startswith("//"):
                     img_url = "https:" + img_url
 
                 books.append({
@@ -121,7 +119,6 @@ def main():
 
     if not new_books:
         print("新刊はありませんでした。")
-        # 履歴ファイルが存在しない初期エラーを防ぐため保存処理を通す
         save_history(history)
         return
 
@@ -129,7 +126,9 @@ def main():
     body_lines = []
     for i, book in enumerate(new_books, 1):
         body_lines.append(f"{i}. [{book['title']}]({book['url']})")
-        body_lines.append(f'<img src="{book["img"]}" width="200">')
+        # 画像URLが取得できている場合のみ表示する
+        if book.get("img"):
+            body_lines.append(f'<img src="{book["img"]}" width="200">')
         body_lines.append("")
 
     body_lines.append("\n@ari20260322")
