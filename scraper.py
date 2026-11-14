@@ -27,18 +27,19 @@ def save_history(history):
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 def extract_real_image_url(item, base_url):
-    """HTML文字列から指定の画像CDNドメインを直接ぶっこ抜く"""
+    """HTML文字列から指定の画像CDNドメインを直接ぶっこ抜く（超強力版）"""
     item_html = str(item)
     
-    # 1. ユーザーから提示されたebookjapanのCDNドメインを直接正規表現で読み取る
-    cdn_match = re.search(r'(https://cache\d*-ebookjapan\.akamaized\.net/[^"\'\s<>]+)', item_html)
+    # 修正箇所: https://や//などの接頭辞に依存せず、ドメイン部分から問答無用で抽出する
+    cdn_match = re.search(r'(cache\d*-ebookjapan\.akamaized\.net/[^"\'\s<>]+)', item_html)
     if cdn_match:
-        # HTMLエンティティ（&amp;など）を元に戻して返す
-        return cdn_match.group(1).replace('&amp;', '&')
+        # 抽出したURL文字列のゴミ（エスケープ文字）を掃除して返す
+        clean_url = cdn_match.group(1).replace('\\/', '/').replace('&amp;', '&')
+        return "https://" + clean_url
 
-    # 2. 見つからなかった場合の予備手段（汎用的な画像URL抽出）
+    # 見つからなかった場合の予備手段
     for tag in item.find_all(["img", "source"]):
-        for attr in ["data-original", "data-src", "srcset", "src"]:
+        for attr in ["data-original", "data-src", "srcset", "src", "lazy-src"]:
             val = tag.get(attr)
             if val:
                 urls = [u.strip().split(" ")[0] for u in val.split(",") if u.strip()]
@@ -73,7 +74,6 @@ def scrape_books(base_url):
 
         soup = BeautifulSoup(res.text, "html.parser")
 
-        # 本のリスト要素を取得
         items = soup.select(".book-item")
         if not items:
             items = soup.select("li.item, div.item, .list-item")
@@ -88,10 +88,9 @@ def scrape_books(base_url):
             if not link_tag:
                 continue
 
-            # タイトルの取得
             title_tag = item.select_one(".title, .name, .book-title, h2, h3")
             
-            # 画像リンクを直接読み取り
+            # 修正した関数で画像リンクを読み取り
             img_url = extract_real_image_url(item, base_url)
 
             title = ""
