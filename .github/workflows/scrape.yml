@@ -35,10 +35,16 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # 【エラー修正箇所】history.jsonが無ければ空ファイルとして作成し、Gitエラーを防ぐ
-          if [ ! -f history.json ]; then
-            echo "[]" > history.json
-          fi
+          # 生成されたすべての履歴ファイル（history_*.json）を追加
+          git add history_*.json
           
-          git add history.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update scraping history" && git push)
+          # 変更がある場合のみコミット
+          if ! git diff --staged --quiet; then
+            git commit -m "Update scraping history for ${{ github.event.client_payload.subject }}"
+            
+            # 【重要】複数の処理が同時に走った時の衝突を防ぐため、push前に最新状態をpullして統合する
+            git pull --rebase origin main
+            git push origin main
+          else
+            echo "No history changes to commit."
+          fi
